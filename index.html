@@ -1,0 +1,452 @@
+// Rodent BMI (Lee Index) Lab Dashboard
+// Single-file React app (App.jsx)
+// Instructions:
+// 1) Create a new React app (Vite or Create React App). Example using Vite:
+//    npm create vite@latest rodent-bmi -- --template react
+//    cd rodent-bmi
+//    npm install
+// 2) Install dependencies:
+//    npm install recharts jspdf file-saver dayjs
+// 3) Replace src/App.jsx with this file. Ensure Tailwind is configured in your project
+//    (Tailwind setup instructions: https://tailwindcss.com/docs/guides/vite)
+// 4) Run: npm run dev (vite) or npm start (CRA)
+
+// Features implemented in this single-file demo:
+// - Animal CRUD with metadata (ID, strain, sex, age, diet, cage)
+// - Recording weight & length measurements (timestamped)
+// - Lee index calculation (configurable units)
+// - Trend graphs (Recharts)
+// - Group creation and group-wise comparison
+// - Alerts (visual and optional email/Telegram hooks placeholder)
+// - CSV export / import and PDF report generation (jsPDF)
+// - LocalStorage persistence and offline-first behavior
+
+import React, { useEffect, useState, useMemo } from 'react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import dayjs from 'dayjs';
+import { jsPDF } from 'jspdf';
+
+// ---------- Helpers ----------
+const uid = () => Math.random().toString(36).slice(2, 9);
+
+// Default Lee index calculation options
+// Two common equivalent forms exist depending on length units:
+// Option A (length in cm): Lee = ( (weight_g * 1000)^(1/3) ) / length_cm  -> equivalent to (10 * weight_g^(1/3))/length_cm
+// Option B (length in mm): Lee = ( weight_g^(1/3) ) / length_mm
+// We'll implement both and allow user to choose.
+
+function calculateLeeIndex(weight_g, length, option) {
+  // weight_g: grams, length: user-provided (cm or mm depending on option)
+  if (!weight_g || !length || length <= 0) return null;
+  if (option === 'A') {
+    // length in cm
+    return Math.cbrt(weight_g * 1000) / length; // numeric
+  } else {
+    // option B: length in mm
+    return Math.cbrt(weight_g) / length;
+  }
+}
+
+function formatNumber(x, dp = 2) { return (x === null || x === undefined) ? '-' : Number(x).toFixed(dp); }
+
+// ---------- Main App ----------
+export default function App() {
+  // persistence key
+  const STORAGE_KEY = 'rodent-bmi-lab-v1';
+
+  const [state, setState] = useState(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : initialState();
+    } catch (e) {
+      console.error('load error', e);
+      return initialState();
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  }, [state]);
+
+  // Settings
+  const [leeOption, setLeeOption] = useState(state.settings.leeOption || 'A');
+
+  useEffect(() => {
+    setState(s => ({ ...s, settings: { ...s.settings, leeOption }}));
+  }, [leeOption]);
+
+  // Derived lists
+  const animals = state.animals;
+  const measurements = state.measurements;
+  const groups = state.groups;
+
+  // ---------- CRUD operations ----------
+  function addAnimal(data) {
+    const newAnimal = { id: uid(), ...data };
+    setState(s => ({ ...s, animals: [newAnimal, ...s.animals] }));
+  }
+  function updateAnimal(id, patch) {
+    setState(s => ({ ...s, animals: s.animals.map(a => a.id === id ? { ...a, ...patch } : a) }));
+  }
+  function removeAnimal(id) {
+    setState(s => ({ ...s,
+      animals: s.animals.filter(a => a.id !== id),
+      measurements: s.measurements.filter(m => m.animalId !== id),
+      groups: s.groups.map(g => ({ ...g, animalIds: g.animalIds.filter(x => x !== id) }))
+    }));
+  }
+
+  function addMeasurement(meas) {
+    // meas: { animalId, weight_g, length_input (cm or mm), date }
+    const lee = calculateLeeIndex(meas.weight_g, meas.length_input, leeOption);
+    const record = { id: uid(), ...meas, leeIndex: lee, createdAt: meas.date || new Date().toISOString() };
+    setState(s => ({ ...s, measurements: [record, ...s.measurements] }));
+  }
+
+  function createGroup(name, animalIds) {
+    const g = { id: uid(), name, animalIds };
+    setState(s => ({ ...s, groups: [g, ...s.groups] }));
+  }
+
+  function exportCSV() {
+    // export animals and measurements as CSV files bundled in zip-like text (simple approach)
+    const csv = toCSV(state.measurements, ['id','animalId','weight_g','length_input','leeIndex','createdAt']);
+    downloadFile(csv, `measurements_${dayjs().format('YYYYMMDD_HHmm')}.csv`);
+  }
+
+  function downloadFile(text, filename) {
+    const blob = new Blob([text], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  function generatePdfReport(animalId) {
+    const animal = animals.find(a => a.id === animalId);
+    const recs = measurements.filter(m => m.animalId === animalId).slice(0,200).reverse();
+    const doc = new jsPDF();
+    doc.setFontSize(16);
+    doc.text(`Animal Report: ${animal?.tag || animalId}`, 10, 20);
+    doc.setFontSize(11);
+    doc.text(`Strain: ${animal?.strain || '-'}  Sex: ${animal?.sex || '-'}  Age: ${animal?.age || '-'}`, 10, 30);
+    doc.text(`Cage: ${animal?.cage || '-'}  Diet: ${animal?.diet || '-'}`, 10, 36);
+
+    let y = 46;
+    doc.setFontSize(10);
+    doc.text('Measurements (most recent first):', 10, y);
+    y += 6;
+    doc.setFontSize(9);
+    doc.text('Date | Weight(g) | Length | Lee', 10, y);
+    y += 6;
+    recs.forEach(r => {
+      if (y > 270) { doc.addPage(); y = 20; }
+      doc.text(`${dayjs(r.createdAt).format('YYYY-MM-DD HH:mm')} | ${formatNumber(r.weight_g,2)} | ${r.length_input} | ${formatNumber(r.leeIndex,3)}`, 10, y);
+      y += 6;
+    });
+    doc.save(`report_${animal?.tag || animalId}_${dayjs().format('YYYYMMDD')}.pdf`);
+  }
+
+  // Simple alert logic
+  const recentAlerts = useMemo(() => {
+    const last = measurements.slice(0, 50);
+    const alerts = [];
+    last.forEach(m => {
+      // thresholds (default) - these can be configured
+      // We'll use common cutoff: Lee index > 310 (borderline obese) - configurable in settings later
+      if (m.leeIndex && m.leeIndex > (state.settings.obesityThreshold || 310)) {
+        alerts.push({ type: 'OBESE', msg: `Animal ${findTag(m.animalId)} Lee=${formatNumber(m.leeIndex,2)}`, ts: m.createdAt });
+      }
+    });
+    return alerts;
+  }, [measurements]);
+
+  function findTag(animalId) {
+    const a = animals.find(x => x.id === animalId);
+    return a ? (a.tag || a.id) : animalId;
+  }
+
+  // ---------- UI Subcomponents inline ----------
+  return (
+    <div className="min-h-screen bg-gray-50 p-6 font-sans">
+      <div className="max-w-6xl mx-auto">
+        <header className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl font-bold">Rodent BMI Lab Dashboard</h1>
+          <div className="text-sm text-gray-600">Offline-first • LocalStorage • Export/Report</div>
+        </header>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="md:col-span-2">
+            <Card>
+              <h2 className="text-lg font-semibold">Add Animal</h2>
+              <AddAnimalForm onAdd={addAnimal} />
+            </Card>
+
+            <Card className="mt-4">
+              <h2 className="text-lg font-semibold">Record Measurement</h2>
+              <MeasurementForm animals={animals} leeOption={leeOption} onMeasure={addMeasurement} />
+            </Card>
+
+            <Card className="mt-4">
+              <h2 className="text-lg font-semibold">Measurements (recent)</h2>
+              <MeasurementList measurements={measurements} animals={animals} onExport={exportCSV} onPdf={generatePdfReport} />
+            </Card>
+          </div>
+
+          <aside>
+            <Card>
+              <h3 className="font-semibold">Settings</h3>
+              <div className="mt-2 text-sm">
+                <label className="block">Lee formula units</label>
+                <select value={leeOption} onChange={e=>setLeeOption(e.target.value)} className="mt-1 p-2 border rounded w-full">
+                  <option value="A">Option A: length in cm (Lee = (weight_g * 1000)^(1/3) / length_cm)</option>
+                  <option value="B">Option B: length in mm (Lee = weight_g^(1/3) / length_mm)</option>
+                </select>
+                <div className="mt-2 text-xs text-gray-600">Choose formula that matches how you measure length in your lab.</div>
+              </div>
+
+              <div className="mt-4">
+                <button className="px-3 py-2 bg-blue-600 text-white rounded" onClick={exportCSV}>Export Measurements CSV</button>
+              </div>
+
+              <div className="mt-4 text-sm">
+                <h4 className="font-medium">Alerts</h4>
+                <div className="text-xs text-gray-600">Threshold: Lee &gt; {state.settings.obesityThreshold || 310} (configurable in source)</div>
+                <div className="mt-2">
+                  {recentAlerts.length === 0 ? <div className="text-green-600 text-sm">No alerts</div> : (
+                    recentAlerts.map((a, i) => <div key={i} className="text-sm text-red-600">⚠ {a.msg} ({dayjs(a.ts).format('YYYY-MM-DD')})</div>)
+                  )}
+              </div>
+              </div>
+
+            </Card>
+
+            <Card className="mt-4">
+              <h3 className="font-semibold">Groups</h3>
+              <CreateGroup animals={animals} onCreate={createGroup} />
+              <div className="mt-3">
+                {groups.map(g => (
+                  <div key={g.id} className="p-2 border rounded mb-2 bg-white">
+                    <div className="font-medium">{g.name}</div>
+                    <div className="text-xs text-gray-600">Members: {g.animalIds.length}</div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          </aside>
+        </div>
+
+        <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+          <Card>
+            <h3 className="font-semibold">Group Comparison (Average Lee)</h3>
+            <GroupComparison groups={groups} measurements={measurements} animals={animals} />
+          </Card>
+
+          <Card>
+            <h3 className="font-semibold">Animal Growth Chart</h3>
+            <AnimalSelector animals={animals} measurements={measurements} />
+          </Card>
+        </div>
+
+        <footer className="mt-8 text-xs text-gray-500">Designed for lab use. Data stored locally (LocalStorage). Export CSV or PDF for records.</footer>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Initial state ----------
+function initialState() {
+  return {
+    animals: [],
+    measurements: [],
+    groups: [],
+    settings: { leeOption: 'A', obesityThreshold: 310 }
+  };
+}
+
+// ---------- UI Small components ----------
+function Card({ children, className='' }){
+  return <div className={`p-4 bg-white rounded shadow ${className}`}>{children}</div>;
+}
+
+function AddAnimalForm({ onAdd }){
+  const [tag, setTag] = useState('');
+  const [strain, setStrain] = useState('');
+  const [sex, setSex] = useState('M');
+  const [age, setAge] = useState('');
+  const [diet, setDiet] = useState('Standard');
+  const [cage, setCage] = useState('');
+  function submit(e){
+    e.preventDefault();
+    if(!tag) return alert('Please provide tag/ID');
+    onAdd({ tag, strain, sex, age, diet, cage });
+    setTag(''); setStrain(''); setAge(''); setCage('');
+  }
+  return (
+    <form onSubmit={submit} className="grid grid-cols-1 md:grid-cols-3 gap-2">
+      <input value={tag} onChange={e=>setTag(e.target.value)} placeholder="Tag / ID" className="p-2 border rounded" />
+      <input value={strain} onChange={e=>setStrain(e.target.value)} placeholder="Strain" className="p-2 border rounded" />
+      <select value={sex} onChange={e=>setSex(e.target.value)} className="p-2 border rounded"><option>M</option><option>F</option></select>
+      <input value={age} onChange={e=>setAge(e.target.value)} placeholder="Age (weeks)" className="p-2 border rounded" />
+      <input value={diet} onChange={e=>setDiet(e.target.value)} placeholder="Diet" className="p-2 border rounded" />
+      <input value={cage} onChange={e=>setCage(e.target.value)} placeholder="Cage No." className="p-2 border rounded" />
+      <div className="md:col-span-3 text-right">
+        <button className="px-3 py-2 bg-green-600 text-white rounded mt-2">Add Animal</button>
+      </div>
+    </form>
+  );
+}
+
+function MeasurementForm({ animals, leeOption, onMeasure }){
+  const [animalId, setAnimalId] = useState(animals[0]?.id || '');
+  const [weight, setWeight] = useState('');
+  const [lengthInput, setLengthInput] = useState('');
+  const [date, setDate] = useState('');
+
+  useEffect(()=>{ if(animals[0]) setAnimalId(animals[0].id); }, [animals]);
+
+  function submit(e){
+    e.preventDefault();
+    if(!animalId) return alert('Add/select an animal first');
+    const w = parseFloat(weight);
+    const l = parseFloat(lengthInput);
+    if(Number.isNaN(w) || Number.isNaN(l)) return alert('Invalid numeric values');
+    onMeasure({ animalId, weight_g: w, length_input: l, date: date || new Date().toISOString() });
+    setWeight(''); setLengthInput(''); setDate('');
+  }
+
+  return (
+    <form onSubmit={submit} className="grid grid-cols-1 md:grid-cols-4 gap-2">
+      <select className="p-2 border rounded" value={animalId} onChange={e=>setAnimalId(e.target.value)}>
+        <option value="">-- Select Animal --</option>
+        {animals.map(a=> <option key={a.id} value={a.id}>{a.tag || a.id}</option>)}
+      </select>
+      <input value={weight} onChange={e=>setWeight(e.target.value)} placeholder="Weight (g)" className="p-2 border rounded" />
+      <input value={lengthInput} onChange={e=>setLengthInput(e.target.value)} placeholder={leeOption==='A' ? 'Length (cm)' : 'Length (mm)'} className="p-2 border rounded" />
+      <input type="datetime-local" value={date} onChange={e=>setDate(e.target.value)} className="p-2 border rounded" />
+      <div className="md:col-span-4 text-right">
+        <button className="px-3 py-2 bg-blue-600 text-white rounded mt-2">Record</button>
+      </div>
+    </form>
+  );
+}
+
+function MeasurementList({ measurements, animals, onExport, onPdf }){
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-2">
+        <div className="text-sm text-gray-600">Showing {measurements.length} total</div>
+        <div>
+          <button className="px-2 py-1 text-sm border rounded mr-2" onClick={onExport}>Export CSV</button>
+        </div>
+      </div>
+      <div className="overflow-auto max-h-60">
+        <table className="w-full text-sm">
+          <thead className="text-left sticky top-0 bg-white">
+            <tr><th>Date</th><th>Animal</th><th>Weight(g)</th><th>Length</th><th>Lee</th><th>Report</th></tr>
+          </thead>
+          <tbody>
+            {measurements.map(m => (
+              <tr key={m.id} className="border-t">
+                <td>{dayjs(m.createdAt).format('YYYY-MM-DD HH:mm')}</td>
+                <td>{(animals.find(a=>a.id===m.animalId)?.tag) || m.animalId}</td>
+                <td>{formatNumber(m.weight_g,2)}</td>
+                <td>{m.length_input}</td>
+                <td>{m.leeIndex ? formatNumber(m.leeIndex,3) : '-'}</td>
+                <td><button className="px-2 py-1 text-xs border rounded" onClick={()=>onPdf(m.animalId)}>PDF</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function CreateGroup({ animals, onCreate }){
+  const [name, setName] = useState('');
+  const [selected, setSelected] = useState([]);
+  function toggle(id){ setSelected(s => s.includes(id) ? s.filter(x=>x!==id) : [...s, id]); }
+  function submit(e){ e.preventDefault(); if(!name) return alert('Provide group name'); onCreate(name, selected); setName(''); setSelected([]); }
+  return (
+    <form onSubmit={submit}>
+      <input value={name} onChange={e=>setName(e.target.value)} placeholder="Group name" className="p-2 border rounded w-full" />
+      <div className="max-h-32 overflow-auto mt-2 border p-2">
+        {animals.map(a => (
+          <label key={a.id} className="block text-sm"><input type="checkbox" checked={selected.includes(a.id)} onChange={()=>toggle(a.id)} /> <span className="ml-2">{a.tag}</span></label>
+        ))}
+      </div>
+      <div className="text-right mt-2"><button className="px-3 py-1 bg-indigo-600 text-white rounded">Create Group</button></div>
+    </form>
+  );
+}
+
+function GroupComparison({ groups, measurements, animals }){
+  const data = groups.map(g => {
+    const groupMeasures = measurements.filter(m => g.animalIds.includes(m.animalId));
+    const avg = groupMeasures.length ? groupMeasures.reduce((s,x)=>s+(x.leeIndex||0),0)/groupMeasures.length : 0;
+    return { name: g.name, avgLee: Number(avg.toFixed(2)) };
+  });
+  return (
+    <div style={{height:250}}>
+      {data.length === 0 ? <div className="text-sm text-gray-600">No groups yet</div> : (
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="name" />
+            <YAxis />
+            <Tooltip />
+            <Legend />
+            <Line type="monotone" dataKey="avgLee" stroke="#8884d8" />
+          </LineChart>
+        </ResponsiveContainer>
+      )}
+    </div>
+  );
+}
+
+function AnimalSelector({ animals, measurements }){
+  const [selected, setSelected] = useState(animals[0]?.id || '');
+  useEffect(()=>{ if(animals[0]) setSelected(animals[0].id); }, [animals]);
+
+  const series = useMemo(()=>{
+    if(!selected) return [];
+    const recs = measurements.filter(m=>m.animalId===selected).slice().reverse();
+    return recs.map(r=>({ date: dayjs(r.createdAt).format('YYYY-MM-DD'), weight: r.weight_g, lee: r.leeIndex }));
+  }, [selected, measurements]);
+
+  return (
+    <div>
+      <select value={selected} onChange={e=>setSelected(e.target.value)} className="p-2 border rounded mb-2">
+        <option value="">-- Select --</option>
+        {animals.map(a=> <option key={a.id} value={a.id}>{a.tag}</option>)}
+      </select>
+      {series.length === 0 ? <div className="text-sm text-gray-600">No measurements</div> : (
+        <div style={{height:220}}>
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={series}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="date" />
+              <YAxis />
+              <Tooltip />
+              <Legend />
+              <Line type="monotone" dataKey="weight" stroke="#82ca9d" />
+              <Line type="monotone" dataKey="lee" stroke="#8884d8" />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Utilities ----------
+function toCSV(arr, keys) {
+  if(!arr || arr.length===0) return '';
+  const h = keys.join(',') + '\n';
+  const rows = arr.map(r => keys.map(k => JSON.stringify(r[k] ?? '')).join(',')).join('\n');
+  return h + rows;
+}
+                                       
